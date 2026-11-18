@@ -1,0 +1,1500 @@
+"""
+Critical angle explorer for a step-index optical fiber (core / cladding / air),
+built around EJ-160 (Eljen Technology scintillating fiber), read into a
+cylindrical PMMA disk (puck).
+
+ONE set of sliders (n1_ref, n2_ref, n3_ref = core/cladding/disk index at the
+589.3nm sodium D-line, plus air_gap_mm) drives everything below.
+
+REAL geometry (confirmed): the disk is a puck with the fiber running through
+its central axis. Only the LAST 18mm of the fiber is actually embedded
+inside the puck - the cladding's outer surface is in direct contact with
+disk (PMMA) material there, not air. Fiber and disk end together at the
+same flat far face; beyond that face is open air to the camera/eye.
+
+This makes core and clad light behave very differently:
+  - CORE light never touches the cladding's outer surface, so it's
+    completely unaffected - it goes straight from core to air in one step
+    at the tip (no intermediate disk medium for core light at all).
+  - CLAD light bounces via TIR at the cladding wall every ~1-3mm along the
+    fiber - so over the 18mm embedded stretch it hits that wall many times
+    before reaching the tip. Since n3~=n2 (near-matched materials), that
+    contact barely reflects at all, so clad light escapes SIDEWAYS into the
+    disk bulk at roughly wherever its bounce pattern first enters the
+    embedded region (modeled as uniformly random along that length, since
+    tracking the exact bounce phase would require simulating the full ~1m
+    of upstream fiber) - then travels straight through the remaining disk
+    bulk to the far face, then refracts into air like normal.
+
+Physics recap - four interfaces, two different Snell's law forms:
+  - core -> cladding (cylindrical, cosine relation):  cos(theta_c) = n2/n1
+  - clad -> disk (cylindrical, cosine relation):       cos(theta_c) = n3/n2
+  - clad/disk -> air (flat, sine relation):            sin(theta_c) = 1/n
+  These are all the same underlying n1*sin(theta1)=n2*sin(theta2) or
+  n1*cos(theta1)=n2*cos(theta2) Snell's law, evaluated at their own
+  boundary case.
+
+n1_ref/n2_ref/n3_ref represent "what if EJ-160's real indices at 589.3nm
+were these, instead of Eljen's published 1.59/1.49 (and disk matched to
+cladding)" - moving them rescales a literature polystyrene/PMMA dispersion
+SHAPE (Sultanova et al.) to match, since Eljen only publishes single index
+numbers, not a full dispersion curve. This is an assumption worth
+remembering: only the 589.3nm point is anchored to real data, everything
+else follows from the borrowed dispersion shape.
+
+Spectrum vs fiber length: the wavelengths of the simulated rays are drawn from
+MEASURED EJ-160 spectra - the 19-position "EJ-160 With Carrier - Light
+Attenuation by Position" data (0.124m to 2.799m, digitized from the plot into
+EJ160_CARRIER_INTENSITY), linearly interpolated in position between the
+nearest two measured curves (lengths outside that range hold the nearest
+measured curve). The fiber_length_m slider therefore reshapes the spectrum
+exactly as measured. Only each curve's SHAPE is used: overall intensity loss
+comes from the attenuation sliders (core A, clad A), and no attenuation
+lengths from any other source are built in. The external LED (~427nm) sits in
+the WLS dye's absorption band and is re-emitted at the dye's own spectrum
+almost immediately (mm-scale absorption length), so the measured spectrum is
+what propagates; the LED data further down is kept for reference only.
+
+On top of that, the radius-dependent core/clad effect comes purely from the
+ray-trace geometry (wavelength-dependent critical angles and escape paths) -
+core and clad rays share the same source spectrum at a given length, and
+differ through the geometry, not through a separate clad spectrum.
+
+SIDE ILLUMINATION (default): the LED shines across the core at the chosen length;
+the dye absorbs it over "LED absorb. len (mm)" and re-emits along the beam path,
+so emitters sit on the LED side of the core. Untick "side illumination" to get
+the concentric-annulus emission below. The measured spectra were taken this way,
+so the wavelength input is unchanged.
+
+FRONT ILLUMINATION (tick "front illum."): LED shining down the core, so the light
+never crosses the cladding/core boundary from the side. The second ~525 nm hump
+is then absent (seen experimentally): the spectrum is the 0.124 m shape with the
+second hump removed (single hump at ~500 nm, independent of length), and emitters
+follow the annulus sliders (uniform by default).
+
+Concentric emission + skew rays: the "emit inner/outer r/R" sliders place
+the emitters in an annulus (0..1 = uniform over the core, e.g. 0.8..1.0 = outer
+ring only). With "include skew rays" on, trapping depends on start radius
+(edge emitters couple ~2x more light than centre ones); off = old
+meridional-only behaviour. Plot 9 shows trapping vs emission radius.
+Plot 10 is the near-field end-face image (light per pixel / centre) plus the
+edge-ring/centre ratio vs LED distance, like the skew-ray deck's slide 24.
+Plot 11 isolates the wavelength spectrum of skew-only light (core-trapped only
+thanks to skew) vs meridional core light vs cladding light.
+Plot 12 = attenuation length vs wavelength fitted from your carrier data. The
+"clad light unshifted" checkbox draws cladding-ray wavelengths from the 0.124 m
+(unshifted) spectrum, on the idea that the second ~525 nm hump comes from
+cladding light being re-emitted by the core dye on its way into the core.
+
+Run this whole cell in Google Colab. ipywidgets ships natively - no install
+needed. Sliders update on release (not every drag pixel) to keep the ray
+trace responsive.
+"""
+
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter, gaussian_filter1d
+from ipywidgets import interact, FloatSlider, Checkbox
+from IPython.display import display
+
+import matplotlib.pyplot as plt
+
+plt.rcParams.update({
+    "axes.labelsize": 14,   # axis labels ("normalized intensity", "radius (mm)")
+    "xtick.labelsize": 12,  # x tick numbers (350, 400, ...)
+    "ytick.labelsize": 12,  # y tick numbers (0.0, 0.2, ...)
+    "axes.titlesize": 14,   # subplot titles
+    "legend.fontsize": 10,  # legend in the left plot
+})
+
+
+# ========================================================================
+# 1. Core physics: critical angle formulas
+# ========================================================================
+
+def critical_angle_core_clad(n1, n2):
+    """Critical angle (degrees) at the core-cladding interface, from the
+    interface normal. None if n2 > n1 (no TIR possible)."""
+    if n2 > n1:
+        return None
+    return np.degrees(np.arcsin(n2 / n1))
+
+
+def critical_angle_clad_air(n2, n_air=1.0):
+    """Critical angle (degrees) at the cladding-air interface, from the
+    interface normal."""
+    return np.degrees(np.arcsin(n_air / n2))
+
+
+def critical_angle_clad_disk(n2, n3):
+    """Critical angle (degrees) at the cladding-disk interface, from the
+    interface normal. None if n3 > n2 (no TIR possible there - see the
+    'always transmits' discussion: TIR only ever happens going into a
+    LOWER index, never a higher one)."""
+    if n3 > n2:
+        return None
+    return np.degrees(np.arcsin(n3 / n2))
+
+
+def sweep_critical_angles(n1, n2_min=1.30, n2_max=1.70, n_points=200):
+    """How both critical angles vary as cladding index n2 sweeps, for a
+    fixed core index n1."""
+    n2_values = np.linspace(n2_min, n2_max, n_points)
+    core_clad = np.array([
+        critical_angle_core_clad(n1, n2) if n2 <= n1 else np.nan
+        for n2 in n2_values
+    ])
+    clad_air = critical_angle_clad_air(n2_values)
+    return n2_values, core_clad, clad_air
+
+
+# ========================================================================
+# 2. EJ-160 emission spectrum (digitized) + material dispersion
+# ========================================================================
+
+# Measured EJ-160 emission spectra at 19 positions along the fiber (the
+# "EJ-160 With Carrier - Light Attenuation by Position" plot: 0.124m to
+# 2.799m, 3 carrier traces per position, averaged). Digitized from that
+# plot's image (pixel-calibrated against its gridlines, lightly smoothed,
+# per-panel dark level subtracted) - accurate to a few percent of the plot's
+# full scale, not instrument-precise. Rows = positions, columns = wavelength.
+# Values are on the plot's own normalized scale (0.124m peak = 1.0); only
+# each row's SHAPE is used by the simulation (see ej160_spectrum_at_length) -
+# overall intensity loss with length comes from the attenuation sliders.
+EJ160_CARRIER_POS_M = np.array([0.124, 0.224, 0.329, 0.489, 0.649, 0.809, 0.969, 1.129, 1.289, 1.449, 1.609, 1.769, 1.929, 2.074, 2.219, 2.364, 2.509, 2.654, 2.799])
+EJ160_CARRIER_WL_NM = np.arange(450.0, 701.0, 5.0)
+EJ160_CARRIER_INTENSITY = np.array([
+    [0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.178, 0.458, 0.759, 0.948, 0.963, 0.862, 0.730, 0.640, 0.601, 0.599, 0.586, 0.544, 0.476, 0.394, 0.317, 0.257, 0.215, 0.187, 0.166, 0.147, 0.125, 0.105, 0.087, 0.067, 0.054, 0.041, 0.036, 0.030, 0.025, 0.021, 0.017, 0.015, 0.011, 0.011, 0.006, 0.004, 0.003, 0.003, 0.003, 0.003, 0.003, 0.003, 0.002, 0.000, 0.000],
+    [0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.082, 0.301, 0.605, 0.836, 0.896, 0.831, 0.715, 0.632, 0.596, 0.596, 0.583, 0.549, 0.481, 0.402, 0.325, 0.264, 0.220, 0.190, 0.171, 0.150, 0.131, 0.108, 0.089, 0.073, 0.059, 0.045, 0.036, 0.032, 0.027, 0.023, 0.019, 0.015, 0.012, 0.009, 0.007, 0.005, 0.004, 0.004, 0.004, 0.004, 0.004, 0.004, 0.004, 0.002, 0.000],
+    [0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.034, 0.185, 0.446, 0.690, 0.795, 0.761, 0.668, 0.592, 0.561, 0.563, 0.556, 0.526, 0.467, 0.388, 0.317, 0.258, 0.214, 0.186, 0.164, 0.149, 0.124, 0.107, 0.088, 0.072, 0.055, 0.042, 0.035, 0.030, 0.026, 0.021, 0.019, 0.015, 0.012, 0.009, 0.007, 0.005, 0.004, 0.004, 0.004, 0.003, 0.002, 0.002, 0.000, 0.002, 0.000],
+    [0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.011, 0.096, 0.307, 0.551, 0.701, 0.699, 0.635, 0.569, 0.546, 0.554, 0.552, 0.527, 0.467, 0.390, 0.321, 0.261, 0.217, 0.186, 0.168, 0.149, 0.127, 0.108, 0.090, 0.069, 0.056, 0.042, 0.034, 0.030, 0.025, 0.023, 0.020, 0.015, 0.012, 0.009, 0.007, 0.005, 0.004, 0.004, 0.004, 0.004, 0.004, 0.004, 0.003, 0.001, 0.000],
+    [0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.007, 0.074, 0.254, 0.478, 0.608, 0.616, 0.564, 0.522, 0.506, 0.517, 0.515, 0.487, 0.426, 0.359, 0.291, 0.236, 0.199, 0.172, 0.156, 0.138, 0.118, 0.100, 0.080, 0.064, 0.049, 0.038, 0.031, 0.025, 0.023, 0.020, 0.015, 0.011, 0.010, 0.006, 0.004, 0.004, 0.004, 0.003, 0.001, 0.000, 0.001, 0.000, 0.000, 0.000, 0.000],
+    [0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.002, 0.042, 0.179, 0.384, 0.536, 0.568, 0.528, 0.495, 0.489, 0.507, 0.506, 0.479, 0.428, 0.359, 0.293, 0.237, 0.201, 0.174, 0.155, 0.135, 0.118, 0.101, 0.083, 0.065, 0.048, 0.038, 0.031, 0.027, 0.021, 0.019, 0.015, 0.014, 0.009, 0.005, 0.005, 0.004, 0.004, 0.003, 0.002, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000],
+    [0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.023, 0.125, 0.311, 0.467, 0.524, 0.501, 0.474, 0.472, 0.485, 0.493, 0.472, 0.425, 0.363, 0.296, 0.241, 0.204, 0.176, 0.158, 0.138, 0.119, 0.101, 0.083, 0.065, 0.050, 0.037, 0.031, 0.025, 0.023, 0.019, 0.015, 0.011, 0.008, 0.006, 0.004, 0.004, 0.004, 0.003, 0.002, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000],
+    [0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.011, 0.088, 0.248, 0.410, 0.481, 0.470, 0.447, 0.451, 0.470, 0.479, 0.463, 0.420, 0.361, 0.294, 0.239, 0.201, 0.175, 0.156, 0.138, 0.118, 0.103, 0.082, 0.068, 0.052, 0.037, 0.029, 0.028, 0.023, 0.019, 0.015, 0.014, 0.010, 0.005, 0.005, 0.004, 0.004, 0.003, 0.001, 0.000, 0.000, 0.000, 0.000, 0.001, 0.000],
+    [0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.003, 0.014, 0.089, 0.249, 0.390, 0.450, 0.438, 0.431, 0.440, 0.464, 0.468, 0.455, 0.409, 0.346, 0.286, 0.232, 0.195, 0.171, 0.154, 0.137, 0.117, 0.097, 0.081, 0.062, 0.048, 0.035, 0.031, 0.026, 0.024, 0.018, 0.014, 0.012, 0.008, 0.006, 0.006, 0.006, 0.006, 0.003, 0.003, 0.003, 0.003, 0.003, 0.003, 0.002, 0.000],
+    [0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.002, 0.007, 0.055, 0.174, 0.301, 0.352, 0.362, 0.355, 0.373, 0.391, 0.396, 0.387, 0.352, 0.303, 0.246, 0.199, 0.171, 0.152, 0.134, 0.118, 0.101, 0.086, 0.070, 0.053, 0.041, 0.032, 0.025, 0.023, 0.017, 0.016, 0.013, 0.010, 0.006, 0.005, 0.005, 0.004, 0.004, 0.004, 0.002, 0.002, 0.002, 0.002, 0.002, 0.001, 0.000],
+    [0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.002, 0.004, 0.035, 0.129, 0.238, 0.300, 0.311, 0.314, 0.327, 0.348, 0.357, 0.354, 0.323, 0.279, 0.231, 0.189, 0.159, 0.141, 0.126, 0.111, 0.096, 0.081, 0.066, 0.050, 0.039, 0.028, 0.023, 0.020, 0.018, 0.014, 0.013, 0.009, 0.007, 0.005, 0.005, 0.005, 0.003, 0.002, 0.002, 0.002, 0.002, 0.002, 0.002, 0.002, 0.000],
+    [0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.005, 0.024, 0.099, 0.203, 0.267, 0.285, 0.286, 0.304, 0.323, 0.340, 0.335, 0.310, 0.271, 0.223, 0.184, 0.154, 0.135, 0.123, 0.110, 0.094, 0.081, 0.067, 0.053, 0.041, 0.030, 0.024, 0.021, 0.020, 0.017, 0.015, 0.012, 0.009, 0.009, 0.009, 0.008, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.001],
+    [0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.002, 0.004, 0.029, 0.104, 0.202, 0.256, 0.271, 0.278, 0.298, 0.328, 0.337, 0.334, 0.308, 0.262, 0.217, 0.181, 0.155, 0.133, 0.123, 0.109, 0.093, 0.080, 0.065, 0.052, 0.039, 0.029, 0.025, 0.023, 0.022, 0.018, 0.015, 0.012, 0.009, 0.007, 0.005, 0.004, 0.004, 0.004, 0.004, 0.004, 0.004, 0.004, 0.003, 0.000, 0.000],
+    [0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.001, 0.018, 0.082, 0.170, 0.226, 0.248, 0.262, 0.276, 0.306, 0.321, 0.317, 0.292, 0.254, 0.208, 0.171, 0.147, 0.131, 0.117, 0.105, 0.091, 0.079, 0.064, 0.050, 0.040, 0.029, 0.024, 0.022, 0.022, 0.019, 0.015, 0.011, 0.011, 0.007, 0.007, 0.003, 0.003, 0.003, 0.003, 0.003, 0.003, 0.003, 0.002, 0.001, 0.000],
+    [0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.001, 0.012, 0.065, 0.144, 0.201, 0.220, 0.238, 0.259, 0.288, 0.300, 0.298, 0.281, 0.241, 0.203, 0.167, 0.142, 0.125, 0.114, 0.101, 0.089, 0.076, 0.062, 0.049, 0.037, 0.028, 0.023, 0.019, 0.019, 0.017, 0.015, 0.012, 0.011, 0.006, 0.004, 0.004, 0.004, 0.004, 0.004, 0.004, 0.004, 0.004, 0.002, 0.002, 0.000],
+    [0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.001, 0.003, 0.009, 0.050, 0.125, 0.184, 0.213, 0.227, 0.248, 0.275, 0.294, 0.294, 0.281, 0.247, 0.207, 0.171, 0.145, 0.128, 0.115, 0.103, 0.091, 0.078, 0.064, 0.051, 0.037, 0.028, 0.023, 0.020, 0.022, 0.016, 0.012, 0.011, 0.010, 0.007, 0.005, 0.004, 0.004, 0.004, 0.004, 0.004, 0.004, 0.004, 0.002, 0.001, 0.000],
+    [0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.009, 0.048, 0.114, 0.161, 0.184, 0.199, 0.221, 0.250, 0.262, 0.265, 0.247, 0.214, 0.182, 0.148, 0.127, 0.111, 0.102, 0.090, 0.078, 0.066, 0.053, 0.042, 0.031, 0.021, 0.019, 0.019, 0.015, 0.014, 0.010, 0.008, 0.005, 0.004, 0.004, 0.004, 0.004, 0.003, 0.004, 0.001, 0.000, 0.000, 0.000, 0.000, 0.000],
+    [0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.006, 0.040, 0.099, 0.148, 0.174, 0.190, 0.214, 0.245, 0.256, 0.259, 0.244, 0.214, 0.177, 0.151, 0.127, 0.111, 0.101, 0.090, 0.079, 0.067, 0.056, 0.041, 0.030, 0.022, 0.019, 0.017, 0.016, 0.014, 0.010, 0.009, 0.007, 0.004, 0.004, 0.004, 0.004, 0.004, 0.002, 0.003, 0.001, 0.001, 0.002, 0.000, 0.000],
+    [0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.003, 0.029, 0.084, 0.131, 0.156, 0.174, 0.201, 0.225, 0.242, 0.246, 0.232, 0.208, 0.173, 0.144, 0.123, 0.107, 0.095, 0.086, 0.076, 0.064, 0.053, 0.040, 0.028, 0.020, 0.017, 0.015, 0.015, 0.013, 0.010, 0.007, 0.004, 0.004, 0.004, 0.004, 0.004, 0.002, 0.001, 0.000, 0.000, 0.001, 0.000, 0.000, 0.000]
+])
+
+
+def ej160_spectrum_at_length(length_m):
+    """Measured EJ-160 spectral SHAPE (unit area) at a given fiber length,
+    linearly interpolated in position between the nearest two measured
+    positions. Lengths outside the measured 0.124-2.799m range are held at
+    the nearest measured spectrum (no extrapolation). Returns (wl_nm, shape)."""
+    pos = EJ160_CARRIER_POS_M
+    shapes = EJ160_CARRIER_INTENSITY / EJ160_CARRIER_INTENSITY.sum(axis=1, keepdims=True)
+    L = float(np.clip(length_m, pos[0], pos[-1]))
+    j = min(int(np.searchsorted(pos, L, side="right")) - 1, len(pos) - 2)
+    t = (L - pos[j]) / (pos[j + 1] - pos[j])
+    return EJ160_CARRIER_WL_NM, (1 - t) * shapes[j] + t * shapes[j + 1]
+
+
+def ej160_measured_at_length(length_m):
+    """Measured EJ-160 spectrum at a fiber length on the common scale of your
+    uploaded plot (every position divided by the biggest amplitude, the 0.124m
+    peak = 1, so longer lengths are shorter curves). Same linear interpolation
+    in position as ej160_spectrum_at_length. Used only to overlay the measured
+    SHAPE on the explorer's spectrum plots. Returns (wl_nm, curve)."""
+    pos = EJ160_CARRIER_POS_M
+    L = float(np.clip(length_m, pos[0], pos[-1]))
+    j = min(int(np.searchsorted(pos, L, side="right")) - 1, len(pos) - 2)
+    t = (L - pos[j]) / (pos[j + 1] - pos[j])
+    row = (1 - t) * EJ160_CARRIER_INTENSITY[j] + t * EJ160_CARRIER_INTENSITY[j + 1]
+    return EJ160_CARRIER_WL_NM, row / EJ160_CARRIER_INTENSITY[0].max()
+
+
+# ------------------------------------------------------------------------
+# Real LED EXCITATION spectrum, from actual spectrometer calibration data
+# ("Calibration(before) LED 11 3.8V 100ms" - 6 repeated time-point scans).
+# This is the real light being shone INTO the fiber end - but it is NOT
+# what travels down the fiber core: at ~427nm it sits in the WLS dye's
+# absorption band, so it gets absorbed and re-emitted at the dye's own
+# (green) emission spectrum (EJ160_CARRIER_INTENSITY above) almost immediately
+# after entering - that conversion isn't itself distance-resolved here (no
+# data for the dye's absorption length, which is normally mm-scale anyway,
+# far shorter than anything else in this simulation), so it's treated as
+# instantaneous at the launch point. simulate_ej160_image() therefore
+# samples from the measured carrier spectra (via sample_ej160_wavelengths), not from
+# this LED spectrum directly - this LED data is kept here for reference/
+# provenance and in case you want to check what fraction of it actually
+# falls in the dye's absorption band.
+# Processing applied to the raw data:
+#   1. Averaged the 6 repeated time-point intensity measurements at each
+#      wavelength (noise reduction).
+#   2. Subtracted an estimated dark/baseline count (median of the flat
+#      200-340nm region, ~71 counts) and clipped negative results to 0.
+#   3. Removed a handful of narrow, isolated spikes near 545-555nm and
+#      626nm via a median filter - these are far too narrow to be real LED
+#      emission and are most likely spectrometer wavelength-calibration
+#      reference lines mixed into this "calibration" file, not the LED's
+#      own smooth output.
+#   4. Normalized to peak = 1, downsampled to 5nm resolution.
+# Result: a real violet/blue LED, peaking at ~427nm, with the expected
+# sharp blue-side rise and a longer tail toward green - NOT the same
+# spectral shape as EJ-160's green scintillation emission.
+# ------------------------------------------------------------------------
+
+LED_SPECTRUM_WL_NM = np.array([
+    350, 355, 360, 365, 370, 375, 380, 385, 390, 395, 400, 405, 410, 415,
+    420, 425, 430, 435, 440, 445, 450, 455, 460, 465, 470, 475, 480, 485,
+    490, 495, 500, 505, 510, 515, 520, 525, 530, 535, 540, 545, 550, 555,
+    560, 565, 570, 575, 580, 585, 590, 595, 600, 605, 610, 615, 620, 625,
+    630, 635, 640, 645
+])
+LED_SPECTRUM_INTENSITY = np.array([
+    0.0017, 0.0000, 0.0000, 0.0007, 0.0031, 0.0041, 0.0087, 0.0236, 0.0856,
+    0.2313, 0.4266, 0.6024, 0.7286, 0.8359, 0.9253, 0.9964, 1.0000, 0.9313,
+    0.8267, 0.7632, 0.7229, 0.6694, 0.5960, 0.4962, 0.4130, 0.3432, 0.2868,
+    0.2263, 0.1833, 0.1517, 0.1183, 0.0932, 0.0751, 0.0635, 0.0522, 0.0446,
+    0.0348, 0.0299, 0.0242, 0.0203, 0.0163, 0.0135, 0.0120, 0.0096, 0.0066,
+    0.0053, 0.0031, 0.0027, 0.0031, 0.0026, 0.0028, 0.0002, 0.0000, 0.0000,
+    0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000
+])
+
+
+def led_emission_spectrum(wavelength_nm):
+    return np.interp(wavelength_nm, LED_SPECTRUM_WL_NM, LED_SPECTRUM_INTENSITY,
+                      left=0.0, right=0.0)
+
+
+def sample_led_wavelengths(n_rays, rng):
+    """Inverse-CDF sampling: draws n_rays wavelengths distributed exactly
+    like the real, processed LED spectrum above."""
+    cdf = np.cumsum(LED_SPECTRUM_INTENSITY)
+    cdf = cdf / cdf[-1]
+    u = rng.random(n_rays)
+    return np.interp(u, cdf, LED_SPECTRUM_WL_NM)
+
+
+def _sellmeier_ps(wavelength_nm):
+    lam_um = wavelength_nm / 1000.0
+    lam2 = lam_um ** 2
+    return np.sqrt(1.0 + 1.4435 * lam2 / (lam2 - 0.020216))
+
+
+def _sellmeier_pmma(wavelength_nm):
+    lam_um = wavelength_nm / 1000.0
+    lam2 = lam_um ** 2
+    return np.sqrt(1.0 + 1.1819 * lam2 / (lam2 - 0.011313))
+
+
+_EJ160_REF_NM = 589.3
+
+# Your actual disk geometry - fixed physical facts, not sliders
+DISK_THICKNESS_MM = 18.0   # 1.8 cm
+DISK_RADIUS_MM = 25.0      # 5 cm diameter
+
+
+def n_core_ej160(wavelength_nm, n_ref=1.59):
+    """n_ref: core index at 589.3nm - defaults to Eljen's published value."""
+    scale = n_ref / _sellmeier_ps(_EJ160_REF_NM)
+    return _sellmeier_ps(wavelength_nm) * scale
+
+
+def n_clad_ej160(wavelength_nm, n_ref=1.49):
+    """n_ref: cladding index at 589.3nm - defaults to Eljen's published value."""
+    scale = n_ref / _sellmeier_pmma(_EJ160_REF_NM)
+    return _sellmeier_pmma(wavelength_nm) * scale
+
+
+def n_disk_ej160(wavelength_nm, n_ref=1.49):
+    """Disk index at 589.3nm - defaults to matching the cladding (n_ref=1.49,
+    confirmed for this setup), but independently adjustable to explore a
+    small real-world mismatch between the two (they're both PMMA-like, but
+    not necessarily identical material/batch). Reuses the PMMA dispersion
+    SHAPE since there's no separate measured dispersion for the disk -
+    same approximation already used for the cladding itself, just anchored
+    to its own independent value here."""
+    scale = n_ref / _sellmeier_pmma(_EJ160_REF_NM)
+    return _sellmeier_pmma(wavelength_nm) * scale
+
+
+# ========================================================================
+# 3. Ray-traced exit-face image, wavelength drawn from the real spectrum
+# ========================================================================
+"""
+Geometry, matching the confirmed real setup: light launched directly into
+the flat core end face from air (Lambertian source), propagates by total
+internal reflection (core-clad: cosine relation at the cylindrical wall;
+flat exit face: sine relation), disk = PMMA matching the CLADDING index
+(n3=n2, NOT index-matched to the core). Landing positions use full 2D
+vector geometry (not naive radial-outward) to avoid a spurious dark center,
+and the rendered histogram is lightly smoothed to avoid shot-noise
+aliasing into fake rings - both are real artifacts to watch for, not
+just cosmetic choices.
+"""
+
+def sample_ej160_wavelengths(n_rays, rng, fiber_length_m=0.124, front=False):
+    """Draw wavelengths from the MEASURED EJ-160 spectrum at this fiber
+    length (ej160_spectrum_at_length) - the spectral shape therefore changes
+    with fiber_length_m exactly as the carrier measurements do (these spectra
+    were measured with SIDE illumination). front=True instead uses the
+    FRONT-illumination spectrum (ej160_front_spectrum_at_length)."""
+    if front:
+        wl_grid, shape = ej160_front_spectrum_at_length(fiber_length_m)
+    else:
+        wl_grid, shape = ej160_spectrum_at_length(fiber_length_m)
+    cdf = np.cumsum(shape + 1e-12)
+    cdf = cdf / cdf[-1]
+    u = rng.random(n_rays)
+    return np.interp(u, cdf, wl_grid)
+
+
+def _unshift_clad_wavelengths(idx_mask, wl, n1, n2, n3, beta0, rng, n1_ref, n2_ref, n3_ref):
+    """
+    "Cladding light is NOT wavelength-shifted" option. The measured spectra
+    were taken by side-illuminating, and the second (~525 nm) hump is taken to
+    come from cladding light being absorbed and re-emitted by the core dye on
+    its way into the core. Cladding light that stays in the cladding is then
+    still the UNSHIFTED source: its wavelengths are drawn from the measured
+    spectrum at the first (shortest) position, 0.124 m, instead of from the
+    spectrum at the chosen fibre length. Core rays are untouched.
+    The ray's air-side angle (n1 sin(beta)) is kept; n1, n2, n3 and beta are
+    re-evaluated at the new wavelength. The core/clad classification is not
+    redone (the index change between ~500 and ~525 nm is ~0.01).
+    """
+    k = int(idx_mask.sum())
+    if k == 0:
+        return
+    sin_air = n1[idx_mask] * np.sin(beta0[idx_mask])
+    wl_new = sample_ej160_wavelengths(k, rng, float(EJ160_CARRIER_POS_M[0]))
+    wl[idx_mask] = wl_new
+    n1[idx_mask] = n_core_ej160(wl_new, n1_ref)
+    n2[idx_mask] = n_clad_ej160(wl_new, n2_ref)
+    n3[idx_mask] = n_disk_ej160(wl_new, n3_ref)
+    beta0[idx_mask] = np.arcsin(np.clip(sin_air / n1[idx_mask], -1, 1))
+
+
+def ej160_attenuation_vs_wavelength(min_signal=0.004, min_points=8):
+    """Single-exponential fit of ln(I) vs position at each wavelength of the
+    19-position carrier data -> effective attenuation length A(lambda) in m.
+    Returns (wavelengths, A, R2); NaN where there is too little signal."""
+    pos = EJ160_CARRIER_POS_M
+    wls = EJ160_CARRIER_WL_NM
+    A = np.full(wls.size, np.nan)
+    R2 = np.full(wls.size, np.nan)
+    for j in range(wls.size):
+        y = EJ160_CARRIER_INTENSITY[:, j]
+        m = y > min_signal
+        if m.sum() < min_points:
+            continue
+        ly = np.log(y[m])
+        p = np.polyfit(pos[m], ly, 1)
+        if p[0] < 0:
+            A[j] = -1.0 / p[0]
+            R2[j] = 1 - (ly - np.polyval(p, pos[m])).var() / ly.var()
+    return wls, A, R2
+
+
+def ej160_front_spectrum_at_length(length_m=None, n_fit=3):
+    """
+    FRONT-illumination spectrum: the same source spectrum with the SECOND
+    (~525 nm) hump removed - front illumination (LED down the core, never
+    crossing the cladding/core boundary from the side) shows a single hump
+    experimentally.
+    Rule: start from the first-position measured spectrum (0.124 m, where the
+    second hump is weakest). Fit the main peak's red-side fall-off (a
+    log-linear fit to the n_fit points just after the peak, ~0.86x per 5 nm)
+    and cap the spectrum at that fall-off beyond the peak, so the shoulder
+    disappears while the blue side, the peak (~500 nm) and the far-red tail
+    are untouched. Area-normalized. The shape does NOT depend on length
+    (length_m is accepted only for call compatibility): with the second hump
+    gone there is no measured length dependence to follow.
+    Returns (wavelengths, shape).
+    """
+    wls, sh = ej160_spectrum_at_length(float(EJ160_CARRIER_POS_M[0]))
+    k = int(np.argmax(sh))
+    idx = np.arange(k + 1, k + 1 + n_fit)
+    p = np.polyfit(wls[idx], np.log(sh[idx]), 1)
+    cap = np.exp(np.polyval(p, wls))
+    out = sh.copy()
+    out[k + 1:] = np.minimum(sh[k + 1:], cap[k + 1:])
+    return wls, out / out.sum()
+
+
+def _sample_side_illumination(n, abs_len_rel, rng):
+    """
+    Emitter positions for SIDE illumination: the LED shines across the fibre
+    (beam along +x, entering from the -x side) at one axial position. The beam
+    covers the whole core width, so y is uniform in [-1, 1] (units of the core
+    radius R); along each chord the dye absorbs the beam (Beer-Lambert,
+    absorption length abs_len_rel in units of R), so the re-emission density
+    falls off as exp(-(x + c) / abs_len_rel) from the LED side, c = sqrt(1 - y^2).
+    Each chord is weighted by the fraction of the beam it absorbs,
+    1 - exp(-2c / abs_len_rel), so thin edge chords emit less.
+    Returns (rho0, phi0) in units of R. abs_len_rel >> 1 -> nearly uniform
+    emission over the cross-section; small -> a thin bright layer on the LED side.
+    """
+    alpha = 1.0 / float(abs_len_rel)
+    p_max = 1.0 - np.exp(-2.0 * alpha)
+    xs, ys, have = [], [], 0
+    while have < n:
+        m = max(int((n - have) * 2.5), 10_000)
+        y = rng.uniform(-1.0, 1.0, m)
+        c = np.sqrt(1.0 - y ** 2)
+        absorbed = 1.0 - np.exp(-2.0 * alpha * c)
+        keep = rng.random(m) < absorbed / p_max
+        y, c, absorbed = y[keep], c[keep], absorbed[keep]
+        u = rng.random(y.size)
+        x = -np.log1p(-u * absorbed) / alpha - c       # truncated exponential along the chord
+        xs.append(x)
+        ys.append(y)
+        have += y.size
+    x = np.concatenate(xs)[:n]
+    y = np.concatenate(ys)[:n]
+    return np.hypot(x, y), np.arctan2(y, x)
+
+
+def _launch_and_classify(n_rays, wl, n1_ref, n2_ref, n3_ref, rng,
+                         emit_rho_min=0.0, emit_rho_max=1.0, skew_rays=True,
+                         return_rho_min=False, side_abs_len_rel=None):
+    """
+    Shared launch + core/clad classification (used by the image simulation
+    AND the spectrum plot so they can never disagree).
+
+    SIDE ILLUMINATION (side_abs_len_rel not None): emitters are placed by
+    _sample_side_illumination (LED shining across the core, dye absorption
+    along the beam) and the annulus arguments are ignored.
+
+    EMISSION POSITION (annulus mode): rays start at normalized radius rho = r/R_core drawn
+    uniformly in AREA between emit_rho_min and emit_rho_max (0..1 = the old
+    uniform-over-the-core case; e.g. 0.8..1.0 = a thin outer ring of emitters).
+
+    SKEW RAYS: a ray launched at radius rho0, azimuth phi0 with transverse
+    direction angle psi has closest approach to the axis
+        rho_min = rho0 * |sin(psi - phi0)|
+    and is core-trapped iff  sin^2(beta) * (1 - rho_min^2) <= 1 - (n2/n1)^2
+    (beta = angle to the fiber axis). At rho0 = 0 this reduces to the usual
+    meridional condition beta <= arccos(n2/n1); near the edge, steep rays that
+    skim the wall are trapped too, so edge emitters couple far more light.
+    skew_rays=False restores the old meridional-only classification.
+    """
+    n1 = n_core_ej160(wl, n1_ref)
+    n2 = n_clad_ej160(wl, n2_ref)
+    n3 = n_disk_ej160(wl, n3_ref)
+    lo, hi = float(emit_rho_min), float(emit_rho_max)
+    if side_abs_len_rel is not None:
+        rho0, phi0 = _sample_side_illumination(n_rays, side_abs_len_rel, rng)
+    else:
+        rho0 = np.sqrt(lo ** 2 + rng.random(n_rays) * (hi ** 2 - lo ** 2))
+        phi0 = rng.random(n_rays) * 2 * np.pi
+    psi_l = rng.random(n_rays) * 2 * np.pi
+    rho_min = rho0 * np.abs(np.sin(psi_l - phi0))
+
+    sin_theta_air = np.sqrt(rng.random(n_rays))
+    beta0 = np.arcsin(np.clip(sin_theta_air / n1, -1, 1))
+    beta_prime = np.arccos(np.clip(1 / n1, -1, 1))
+    if skew_rays:
+        lhs = np.sin(beta0) ** 2 * (1 - rho_min ** 2)
+        rhs = np.clip(1 - (n2 / n1) ** 2, 0, None)
+        is_core = lhs <= rhs
+    else:
+        beta_trap = np.arccos(np.clip(n2 / n1, -1, 1))
+        is_core = beta0 <= beta_trap
+    is_clad = (~is_core) & (beta0 <= beta_prime)
+    if return_rho_min:
+        return n1, n2, n3, beta0, is_core, is_clad, rho0, phi0, rho_min
+    return n1, n2, n3, beta0, is_core, is_clad, rho0, phi0
+
+
+def simulate_endface_near_field(n_rays=600_000, r_core_mm=0.485,
+                                n1_ref=1.59, n2_ref=1.49, n3_ref=1.49,
+                                fiber_length_m=0.075, atten_core_m=4.0,
+                                wall_loss_per_bounce=0.0, collect_deg=25.0,
+                                emit_rho_min=0.0, emit_rho_max=1.0,
+                                skew_rays=True, rng=None, side_abs_len_rel=None,
+                                front_spectrum=False):
+    """
+    NEAR-FIELD image of the fiber END FACE (light per pixel, like the
+    "end face, colour = light / centre" picture in the skew-ray deck).
+
+    Only core-trapped rays reach the end face. A trapped ray's transverse path
+    is a straight chord of the core circle at distance rho_min from the axis
+    (rho_min = 0 for meridional rays, which pass through the centre). After
+    the many wall bounces over the fibre length its phase is random, so its
+    exit point is uniform along that chord -> (x, y).
+    Each ray carries a weight:
+        exp(-(d / cos(beta)) / atten_core_m)        path-length attenuation
+        * (1 - wall_loss_per_bounce) ** N_bounces   wall-reflection loss,
+            N = d * tan(beta) / (2 R sqrt(1 - rho_min^2))
+    (skew rays have longer paths and more bounces). Only rays whose in-fibre
+    angle beta <= collect_deg are counted (camera / sanded-face acceptance).
+    skew_rays=False only switches off the skew-enhanced TRAPPING criterion
+    (meridional cutoff instead); the rays' geometry (rho_min) is still real.
+    Returns (x, y, weight) with x, y in units of the core radius.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    wl = sample_ej160_wavelengths(n_rays, rng, fiber_length_m, front_spectrum)
+    n1, n2, n3, beta0, is_core, _, _, _, rho_min = _launch_and_classify(
+        n_rays, wl, n1_ref, n2_ref, n3_ref, rng,
+        emit_rho_min, emit_rho_max, skew_rays, return_rho_min=True,
+        side_abs_len_rel=side_abs_len_rel)
+    keep = is_core & (beta0 <= np.radians(collect_deg))
+    b, rm = beta0[keep], rho_min[keep]
+    d_mm = fiber_length_m * 1000.0
+    w = np.exp(-(fiber_length_m / np.cos(b)) / atten_core_m)
+    if wall_loss_per_bounce > 0:
+        n_b = d_mm * np.tan(b) / (2 * r_core_mm * np.sqrt(np.clip(1 - rm ** 2, 1e-6, None)))
+        w = w * (1 - wall_loss_per_bounce) ** n_b
+    h = np.sqrt(1 - rm ** 2)
+    s_pos = (2 * rng.random(b.size) - 1) * h
+    a = rng.random(b.size) * 2 * np.pi
+    x = rm * np.cos(a) - s_pos * np.sin(a)
+    y = rm * np.sin(a) + s_pos * np.cos(a)
+    return x, y, w
+
+
+def simulate_ej160_image(n_rays=300_000, r_core_mm=0.485, air_gap_mm=20.0,
+                          disk_thickness_mm=18.0, disk_radius_mm=25.0,
+                          n1_ref=1.59, n2_ref=1.49, n3_ref=1.49,
+                          fiber_length_m=1.0, atten_core_m=4.0,
+                          atten_clad_m=0.11, rng=None, return_label=False,
+                          emit_rho_min=0.0, emit_rho_max=1.0, skew_rays=True,
+                          screen_radius_mm=50.0, clad_unshifted=False,
+                          side_abs_len_rel=None, front_spectrum=False):
+    """
+    fiber_length_m: length of fiber the light travels before reaching the
+    disk. Has NO effect on angles/geometry/classification (those depend
+    only on n1, n2 - see the core/clad discussion above). It does two
+    separate things:
+      (1) SPECTRAL SHAPE: the wavelengths of the launched rays are drawn
+          from the MEASURED EJ-160 spectrum at this length (the 19-position
+          carrier data, interpolated - see ej160_spectrum_at_length), so the
+          spectrum reshapes with length exactly as measured.
+      (2) INTENSITY: how many rays survive the trip, via Beer-Lambert
+          attenuation, survival probability = exp(-fiber_length_m / A),
+          using the attenuation-length sliders below. The carrier data is
+          used for shape only - no attenuation lengths are taken from it or
+          from any other source, so intensity loss is entirely under the
+          sliders' control.
+    This length-dependent spectral shape is on top of (not instead of) the
+    radius-dependent angular-selection effect already in the core/clad
+    geometry below - the two are independent and both operate.
+
+    atten_core_m: core light's (single, flat) attenuation length.
+
+    atten_clad_m: clad light keeps a single flat attenuation length (no
+    equivalent wavelength-resolved cut-back measurement for clad light -
+    its loss mechanism is believed to be dominated by surface scattering
+    at the exposed, handling-sensitive clad-air surface, not bulk
+    self-absorption, so it's much less wavelength-selective). Default is
+    YOUR fiber's actual measured value, A=0.11m - clad attenuates far
+    faster than core, an even
+    bigger gap than Hawkes et al. (NIM A292, 1990) found for their
+    SCSF-81 fiber (A=3.3m core, A=0.18m clad) - consistent with the same
+    physical mechanism they describe (well-controlled core-clad interface
+    vs. an exposed, handling-sensitive clad-air surface), just more
+    pronounced here.
+
+    n3_ref: disk index at 589.3nm, independent of n2_ref (cladding) - set
+    equal to n2_ref for the confirmed "disk = cladding material" case, or
+    move it slightly to explore a real, small manufacturing/batch mismatch.
+
+    REAL geometry (confirmed): the disk is a cylindrical puck with the fiber
+    running through its central axis. Only the LAST disk_thickness_mm of the
+    fiber's length is actually embedded inside the puck - the cladding's
+    outer surface is in direct contact with the disk (PMMA) there, not air.
+    Fiber and disk end together at the same flat far face; beyond that face
+    is open air to the camera/eye.
+
+    This changes core and clad light very differently:
+
+    CORE light never touches the cladding's outer surface at all, so it's
+    completely unaffected by any of this - it reaches the tip and exits
+    DIRECTLY from core into air in a single step. No intermediate disk
+    medium for core light at all (there's effectively a "hole" through the
+    disk where the fiber sits, so nothing of the disk is in core light's
+    path).
+
+    CLAD light bounces via TIR at the cladding wall every ~1-3mm along the
+    fiber (for a ~1mm fiber, depending on angle) - so over an 18mm embedded
+    stretch, it hits that wall MANY times before ever reaching the tip. And
+    since n3~=n2 (near-matched materials), there's essentially no TIR at a
+    clad-DISK interface - almost every contact transmits straight through.
+    So clad light escapes SIDEWAYS into the disk bulk at roughly wherever
+    its bounce pattern first enters the embedded region - not concentrated
+    at the tip. We have no way to track the exact bounce phase without
+    simulating the full ~1m of upstream fiber, so the escape position is
+    modeled as uniformly random along the embedded length - a reasonable
+    approximation given how many bounces occur over that distance. From
+    there it's a straight line through the remaining disk bulk to the far
+    face, then a normal flat-interface refraction into air.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # Wavelengths come from the MEASURED EJ-160 spectrum at this fiber
+    # length (the 19-position carrier data, interpolated between positions),
+    # not from the raw external LED spectrum: the ~427nm LED sits in the WLS
+    # dye's absorption band, so it is absorbed and re-emitted at the dye's
+    # own (green) spectrum almost immediately after entering the fiber
+    # (mm-scale absorption length, negligible next to meter-scale fibers) -
+    # that re-emitted light is what travels, and it is exactly what the
+    # carrier data measured. The same shape is used for core AND clad rays
+    # (no separate clad-light measurement exists); clad vs core then differ
+    # through the geometry below, not through a different source spectrum.
+    wl = sample_ej160_wavelengths(n_rays, rng, fiber_length_m, front_spectrum)
+    n1, n2, n3, beta0, is_core, is_clad, rho0_all, phi0_all, rho_min_all = _launch_and_classify(
+        n_rays, wl, n1_ref, n2_ref, n3_ref, rng,
+        emit_rho_min, emit_rho_max, skew_rays, return_rho_min=True,
+        side_abs_len_rel=side_abs_len_rel)
+    if clad_unshifted:
+        _unshift_clad_wavelengths(is_clad, wl, n1, n2, n3, beta0, rng, n1_ref, n2_ref, n3_ref)
+
+    # Attenuation over the fiber length (Beer-Lambert): each ray survives
+    # the trip with probability exp(-fiber_length_m / attenuation_length).
+    # This has NO effect on angle/position (survivors keep their exact
+    # geometry) - it only thins out how many rays of each type make it to
+    # the disk at all, exactly like real photon loss along the fiber.
+    # Core and clad each use their own single (slider-set) attenuation
+    # length; the length-dependent spectral reshaping is already in the
+    # sampled wavelengths above, so intensity loss does not touch it.
+    surv_draw = rng.random(n_rays)
+    core_survives = surv_draw < np.exp(-fiber_length_m / atten_core_m)
+    clad_survives = surv_draw < np.exp(-fiber_length_m / atten_clad_m)
+    is_core = is_core & core_survives
+    is_clad = is_clad & clad_survives
+
+    x_final_list, y_final_list, wl_final_list, label_final_list = [], [], [], []
+
+    # ---- CORE light: single direct step, core -> air, no disk involved ----
+    if is_core.any():
+        n1c, wlc, b0c = n1[is_core], wl[is_core], beta0[is_core]
+        sin_air_core = np.clip(n1c * np.sin(b0c), -1, 1)
+        ok = np.abs(n1c * np.sin(b0c)) <= 1
+        beta_air_core = np.arcsin(sin_air_core[ok])
+        nc = ok.sum()
+        # Exit position at the end face: NOT the emission point. After many
+        # wall bounces the ray's phase is random, so it exits at a uniform
+        # point along its chord (closest approach rho_min to the axis), the
+        # same placement used by the near-field Plot 10.
+        rm = rho_min_all[is_core][ok]
+        h = np.sqrt(1 - rm ** 2)
+        s_pos = (2 * rng.random(nc) - 1) * h
+        a_c = rng.random(nc) * 2 * np.pi
+        x0 = r_core_mm * (rm * np.cos(a_c) - s_pos * np.sin(a_c))
+        y0 = r_core_mm * (rm * np.sin(a_c) + s_pos * np.cos(a_c))
+        psi = rng.random(nc) * 2 * np.pi
+        R_air = air_gap_mm * np.tan(beta_air_core)
+        xc, yc = x0 + R_air * np.cos(psi), y0 + R_air * np.sin(psi)
+        on_screen = np.hypot(xc, yc) <= screen_radius_mm   # finite screen (skew rays can exit very steeply)
+        x_final_list.append(xc[on_screen])
+        y_final_list.append(yc[on_screen])
+        wl_final_list.append(wlc[ok][on_screen])
+        label_final_list.append(np.zeros(int(on_screen.sum()), dtype=bool))   # False = core
+
+    # ---- CLAD light: escapes radially into the disk bulk at a random
+    # axial position along the embedded length, then straight-line to the
+    # far face, then refracts into air ----
+    if is_clad.any():
+        n1l, n2l, n3l, wll, b0l = n1[is_clad], n2[is_clad], n3[is_clad], wl[is_clad], beta0[is_clad]
+        n_l = b0l.size
+
+        cb = (n1l / n2l) * np.cos(b0l)
+        beta_c = np.arccos(np.clip(cb, -1, 1))   # axial angle within the cladding
+
+        d = rng.random(n_l) * disk_thickness_mm   # random escape position along the embedded length
+        remaining = disk_thickness_mm - d
+
+        cos_bd = (n2l / n3l) * np.cos(beta_c)
+        escapes_wall = np.abs(cos_bd) <= 1        # no TIR at the clad->disk cylindrical interface
+        beta_disk = np.arccos(np.clip(cos_bd[escapes_wall], -1, 1))
+
+        n_e = escapes_wall.sum()
+        r0 = rho0_all[is_clad][escapes_wall] * r_core_mm
+        phi0 = phi0_all[is_clad][escapes_wall]
+        x0 = r0 * np.cos(phi0)
+        y0 = r0 * np.sin(phi0)
+        psi = rng.random(n_e) * 2 * np.pi   # escape direction - conserved through to the air side
+
+        R_disk = remaining[escapes_wall] * np.tan(beta_disk)
+        x_face = x0 + R_disk * np.cos(psi)
+        y_face = y0 + R_disk * np.sin(psi)
+        hit_side_wall = np.hypot(x_face, y_face) > disk_radius_mm
+
+        n3e = n3l[escapes_wall]
+        sin_air = n3e * np.sin(beta_disk)
+        tir_at_disk_air = sin_air > 1.0
+        ok = (~hit_side_wall) & (~tir_at_disk_air)
+
+        beta_air = np.arcsin(np.clip(sin_air[ok], -1, 1))
+        R_air = air_gap_mm * np.tan(beta_air)
+        x_final_list.append(x_face[ok] + R_air * np.cos(psi[ok]))
+        y_final_list.append(y_face[ok] + R_air * np.sin(psi[ok]))
+        wl_final_list.append(wll[escapes_wall][ok])
+        label_final_list.append(np.ones(int(ok.sum()), dtype=bool))   # True = clad
+
+    if not x_final_list:
+        empty = np.array([])
+        if return_label:
+            return empty, empty, empty, empty.astype(bool)
+        return empty, empty, empty
+
+    x_out = np.concatenate(x_final_list)
+    y_out = np.concatenate(y_final_list)
+    wl_out = np.concatenate(wl_final_list)
+    if return_label:
+        label_out = np.concatenate(label_final_list)   # False=core, True=clad
+        return x_out, y_out, wl_out, label_out
+    return x_out, y_out, wl_out
+
+
+# ========================================================================
+# 4. One function, one set of sliders, four plots
+# ========================================================================
+
+R_CORE_MM_DEFAULT = 0.485
+r_core_edge_mm = R_CORE_MM_DEFAULT
+
+
+def explore_fiber(n1_ref=1.59, n2_ref=1.49, n3_ref=1.49, air_gap_mm=20.0,
+                   fiber_length_m=1.0, atten_core_m=4.0,
+                   atten_clad_m=0.11, emit_rho_min=0.0, emit_rho_max=1.0,
+                   skew_rays=True, collect_deg=25.0, wall_loss_pct=0.05, clad_unshifted=False,
+                   side_illum=True, led_abs_len_mm=1.0, front_illum=False):
+    emit_rho_max = max(emit_rho_max, emit_rho_min + 0.02)
+    # SIDE illumination: LED shines across the core at the chosen length; the
+    # dye absorbs it over led_abs_len_mm and re-emits along the beam path. The
+    # emission-annulus sliders only apply when this is switched off.
+    # FRONT illumination (LED down the core): single-hump spectrum (second hump removed),
+    # emitters spread by the annulus sliders.
+    side_rel = (led_abs_len_mm / 0.485) if (side_illum and not front_illum) else None
+    n_rays_image = 800_000
+    rng = np.random.default_rng(0)
+
+    # ---- numbers ----
+    tc1 = critical_angle_core_clad(n1_ref, n2_ref)
+    tc2 = critical_angle_clad_air(n2_ref)
+    tc3 = critical_angle_clad_air(n3_ref)             # same formula, disk->air interface
+    tc4 = critical_angle_clad_disk(n2_ref, n3_ref)     # clad->disk
+    print(f"n1 (core, @589nm)     = {n1_ref:.4f}")
+    print(f"n2 (cladding, @589nm) = {n2_ref:.4f}")
+    print(f"n3 (disk, @589nm)     = {n3_ref:.4f}")
+    print(f"core -> clad critical angle = {tc1:.2f} deg" if tc1 is not None
+          else f"core -> clad: no TIR possible (n2={n2_ref:.4f} > n1={n1_ref:.4f}, always transmits)")
+    print(f"clad -> air critical angle  = {tc2:.2f} deg")
+    print(f"disk -> air critical angle  = {tc3:.2f} deg")
+    print(f"clad -> disk critical angle = {tc4:.2f} deg" if tc4 is not None
+          else f"clad -> disk: no TIR possible (n3={n3_ref:.4f} > n2={n2_ref:.4f}, always transmits)")
+    print()
+
+    # ---- plot 1: generic sweep vs index, all four boundaries marked ----
+    # core->clad and clad->disk share one form (arcsin(x/n_inner)), swept
+    # against the OUTER material's index, x; "-> air" (clad or disk) shares
+    # the other form (arcsin(1/x)), swept against whichever material is
+    # escaping into air.
+    index_values, core_clad, to_air = sweep_critical_angles(n1_ref)
+    clad_disk_curve = np.array([
+        critical_angle_clad_disk(n2_ref, x) if x <= n2_ref else np.nan
+        for x in index_values
+    ])
+
+    fig1, ax1 = plt.subplots(figsize=(7.5, 4.5))
+    ax1.plot(index_values, core_clad, label="core -> clad", color="tab:blue", linewidth=2)
+    ax1.plot(index_values, to_air, label="-> air (clad or disk)", color="tab:orange", linewidth=2)
+    ax1.plot(index_values, clad_disk_curve, label="clad -> disk", color="tab:purple", linewidth=2)
+
+    ax1.axvline(n2_ref, color="gray", linestyle="--", linewidth=1)
+    ax1.axvline(n3_ref, color="darkgray", linestyle=":", linewidth=1)
+
+    if tc1 is not None:
+        ax1.plot(n2_ref, tc1, "o", color="tab:blue", ms=8, label="core->clad @ n2")
+    ax1.plot(n2_ref, tc2, "o", color="tab:orange", ms=8, label="clad->air @ n2")
+    ax1.plot(n3_ref, tc3, "s", color="tab:green", ms=9, label="disk->air @ n3")
+    if tc4 is not None:
+        ax1.plot(n3_ref, tc4, "^", color="tab:purple", ms=9, label="clad->disk @ n3")
+
+    ax1.set_xlabel("index (n2 or n3)")
+    ax1.set_ylabel("critical angle (degrees)")
+    ax1.set_title(f"All four critical angles  (core index n1 = {n1_ref:.4f})")
+    ax1.set_ylim(0, 90)
+    ax1.legend(fontsize=8, ncol=2)
+    ax1.grid(alpha=0.3)
+    plt.show()
+
+    # ---- plot 3: ray-traced exit image ----
+    x, y, wl_valid = simulate_ej160_image(n_rays=n_rays_image, air_gap_mm=air_gap_mm,
+                                            n1_ref=n1_ref, n2_ref=n2_ref, n3_ref=n3_ref,
+                                            fiber_length_m=fiber_length_m,
+                                            atten_core_m=atten_core_m,
+                                            atten_clad_m=atten_clad_m, rng=rng,
+                                            emit_rho_min=emit_rho_min, emit_rho_max=emit_rho_max,
+                                            skew_rays=skew_rays, clad_unshifted=clad_unshifted,
+                                            side_abs_len_rel=side_rel, front_spectrum=front_illum)
+    R = np.hypot(x, y)
+    extent = np.percentile(R, 99.5) * 1.15 if R.size else 1.0
+    h, _, _ = np.histogram2d(x, y, bins=150, range=[[-extent, extent], [-extent, extent]])
+    h = gaussian_filter(h, sigma=1.5)
+    fig3, ax3 = plt.subplots(figsize=(6, 6))
+    ax3.imshow(h.T ** 0.55, origin="lower", extent=[-extent, extent, -extent, extent], cmap="inferno")
+    ax3.set_facecolor("black")
+    ax3.set_xlabel("mm")
+    ax3.set_ylabel("mm")
+    ax3.set_title(f"EJ-160 exit image, {air_gap_mm:.0f} mm past the disk, fiber={fiber_length_m:.2f}m\n"
+                   f"(disk: {DISK_THICKNESS_MM:.1f} mm thick, {DISK_RADIUS_MM:.0f} mm radius)")
+    plt.show()
+    print(f"rays surviving to the image: {R.size} / {n_rays_image} ({R.size/n_rays_image:.1%})")
+    print()
+
+    # ---- plot 6: wavelength spectrum of core light, clad light, and their
+    # total (everything reaching the disk), side by side ----
+    # This only needs the core/clad classification, not the full disk/air
+    # ray trace, so it's computed directly here rather than reusing
+    # simulate_ej160_image() - faster, and it isolates exactly the
+    # wavelength-dependent bias between the two populations (see the
+    # mean-wavelength-vs-radius discussion above: redder light is very
+    # slightly less likely to end up core-trapped).
+    n_rays_spectrum = 1_000_000
+    wl_s = sample_ej160_wavelengths(n_rays_spectrum, rng, fiber_length_m, front_illum)   # measured spectrum at this length
+    n1_s, n2_s, n3_s, beta0_s, is_core_geom, is_clad_geom, _, _ = _launch_and_classify(
+        n_rays_spectrum, wl_s, n1_ref, n2_ref, n3_ref, rng,
+        emit_rho_min, emit_rho_max, skew_rays, side_abs_len_rel=side_rel)
+    if clad_unshifted:
+        wl_s = wl_s.copy()
+        _unshift_clad_wavelengths(is_clad_geom, wl_s, n1_s, n2_s, n3_s, beta0_s, rng, n1_ref, n2_ref, n3_ref)
+    lost_at_launch = ~is_core_geom & ~is_clad_geom   # genuinely escapes sideways, angle too steep
+
+    # Fiber-length attenuation, applied on top of the geometric classification
+    # (same as in simulate_ej160_image, for consistency with the other plots).
+    # Core uses its single slider-set attenuation length, same as
+    # simulate_ej160_image; wl_s was drawn from the measured spectrum at this
+    # fiber_length_m, so wl_core's histogram below reflects that real shape.
+    # This is a SEPARATE loss mechanism from lost_at_launch above - don't
+    # conflate "attenuated away over distance" with "never trapped at all".
+    surv_draw_s = rng.random(n_rays_spectrum)
+    is_core_s = is_core_geom & (surv_draw_s < np.exp(-fiber_length_m / atten_core_m))
+    is_clad_s = is_clad_geom & (surv_draw_s < np.exp(-fiber_length_m / atten_clad_m))
+
+    # "light actually inside the disk" = clad light that survives the
+    # clad -> disk CYLINDRICAL refraction (cosine relation, matching the
+    # corrected geometry in simulate_ej160_image - NOT the old flat/sine
+    # relation this used before the geometry fix). CORE light never
+    # touches the disk medium at all in this geometry (it goes straight
+    # from core to air at the tip), so it's correctly excluded here, not
+    # unioned in.
+    beta_c_s = np.arccos(np.clip(
+        (n1_s[is_clad_s] / n2_s[is_clad_s]) * np.cos(beta0_s[is_clad_s]), -1, 1))
+    cos_bd_s = (n2_s[is_clad_s] / n3_s[is_clad_s]) * np.cos(beta_c_s)
+    escapes_wall_s = np.abs(cos_bd_s) <= 1
+
+    in_disk_s = np.zeros(n_rays_spectrum, dtype=bool)
+    clad_idx = np.where(is_clad_s)[0]
+    in_disk_s[clad_idx[escapes_wall_s]] = True
+
+    wl_core = wl_s[is_core_s]
+    wl_clad = wl_s[is_clad_s]
+    wl_disk = wl_s[in_disk_s]
+    pct_of_total = [is_core_s.mean(), is_clad_s.mean(), in_disk_s.mean()]
+
+    fig6, axes6 = plt.subplots(1, 3, figsize=(14, 4), sharey=True)
+    bins = np.linspace(345, 650, 60)
+    for ax, data, title, color, pct in zip(
+        axes6, [wl_core, wl_clad, wl_disk],
+        ["Core light (in fiber)", "Cladding light (in fiber)", "Clad light now inside disk bulk"],
+        ["tab:blue", "tab:orange", "tab:green"], pct_of_total,
+    ):
+        ax.hist(data, bins=bins, color=color, alpha=0.85)
+        ax.set_title(f"{title}\nn={data.size:,}  ({pct:.1%} of all launched rays)")
+        ax.set_xlabel("wavelength (nm)")
+    axes6[0].set_ylabel("ray count")
+    fig6.suptitle("Wavelength spectrum by population")
+    fig6.tight_layout()
+    plt.show()
+
+    print(f"core light (after attenuation):  {is_core_s.mean():.1%} of all launched rays (bypasses disk medium entirely)")
+    print(f"clad light (after attenuation):  {is_clad_s.mean():.1%} of all launched rays")
+    print(f"lost at launch (angle too steep, never trapped at all): {lost_at_launch.mean():.1%} of all launched rays")
+    print(f"attenuated away over the fiber (core): {(is_core_geom & ~is_core_s).mean():.1%} of all launched rays")
+    print(f"attenuated away over the fiber (clad): {(is_clad_geom & ~is_clad_s).mean():.1%} of all launched rays")
+    print(f"disk light (clad that made it into the disk bulk): {in_disk_s.mean():.1%} of all launched rays"
+          + f"  ({in_disk_s.sum()/max(is_clad_s.sum(),1):.1%} of surviving clad light specifically)"
+          + (" - some TIR'd back at clad/disk wall" if in_disk_s.sum() < is_clad_s.sum() else ""))
+
+    # ---- plot 7: signal vs distance, matching the classic attenuation-length
+    # plots in Hawkes/Amos et al. (e.g. their Fig. 11: log-scale signal vs
+    # source-to-detector distance) ----
+    # Uses the SAME d=0 core/clad split already computed above (before any
+    # attenuation was applied). Both populations decay as simple single
+    # exponentials with their slider-set attenuation lengths (the spectral
+    # reshaping with length comes from the measured carrier data and doesn't
+    # enter the intensity decay).
+    distances_m = np.linspace(0.001, 5.0, 200)
+    frac_core_0 = is_core_geom.mean()
+    frac_clad_0 = is_clad_geom.mean()
+    ARB_SCALE = 1000.0   # arbitrary units, just to visually match the papers' y-axis scale
+
+    signal_core = ARB_SCALE * frac_core_0 * np.exp(-distances_m / atten_core_m)
+    signal_clad = ARB_SCALE * frac_clad_0 * np.exp(-distances_m / atten_clad_m)
+    signal_total = signal_core + signal_clad
+
+    fig7, ax7 = plt.subplots(figsize=(7, 5.5))
+    ax7.semilogy(distances_m, signal_core, color="tab:blue", linewidth=2, label="core light")
+    ax7.semilogy(distances_m, signal_clad, color="tab:orange", linewidth=2, label="clad light")
+    ax7.semilogy(distances_m, signal_total, color="black", linewidth=2, linestyle="--", label="total (core+clad)")
+    ax7.axvline(fiber_length_m, color="gray", linestyle=":", linewidth=1,
+                label=f"current fiber length ({fiber_length_m:.2f} m)")
+    ax7.set_xlabel("Distance - Source to Detector (m)")
+    ax7.set_ylabel("Signal (Arb. Units)")
+    ax7.set_title(f"Attenuation vs distance\n(core A={atten_core_m:.2f}m, clad A={atten_clad_m:.2f}m)")
+    ax7.legend(fontsize=9)
+    ax7.grid(alpha=0.3, which="both")
+    ax7.set_ylim(50, 1500)   # matches the reference figure's y-axis range (Fig. 11, Amos et al.)
+    fig7.tight_layout()
+    plt.show()
+
+    d_cross_idx = np.argmin(np.abs(signal_core - signal_clad))
+    print(f"core/clad crossover (clad drops below core): ~{distances_m[d_cross_idx]:.2f} m")
+    print()
+
+    # ---- plot 8: wavelength spectrum resolved by radius (0.01mm shells) ----
+    # The actual wavelength spectrum SHAPE (not just its mean, see plot 5
+    # above) at a set of representative radii, each drawn from its own
+    # ~0.01mm-wide shell - so you can see the full distribution shift/deform
+    # with radius, not just a single summary number. A shell is widened
+    # automatically (reported below) only if 0.01mm alone is too sparse to
+    # plot cleanly; this is noted rather than hidden.
+    n_rays_radius = 6_000_000
+    x8, y8, wl8, is_clad8 = simulate_ej160_image(
+        n_rays=n_rays_radius, air_gap_mm=air_gap_mm,
+        n1_ref=n1_ref, n2_ref=n2_ref, n3_ref=n3_ref,
+        fiber_length_m=fiber_length_m, atten_core_m=atten_core_m,
+        atten_clad_m=atten_clad_m,
+        emit_rho_min=emit_rho_min, emit_rho_max=emit_rho_max, skew_rays=skew_rays, clad_unshifted=clad_unshifted,
+        side_abs_len_rel=side_rel, front_spectrum=front_illum,
+        rng=rng, return_label=True)
+    R8 = np.hypot(x8, y8)
+
+    if R8.size < 200:
+        print("Not enough light reached the image to resolve a spectrum-vs-radius plot.")
+    else:
+        # Use the true max radius (not a percentile) so the axis always
+        # captures every ray that reached the image - a percentile cutoff
+        # (as used for visual framing in plots 3-5) would silently clip the
+        # outer tail, which is exactly where clad light tends to live.
+        extent8 = R8.max() * 1.01
+
+        # Detect the core spot's outer edge: core light has a hard maximum
+        # exit radius (set by its angular cutoff at the core-clad critical
+        # angle), so beyond that radius only clad light can land - the
+        # population flips from mixed to ~100% clad over a narrow range.
+        # Finding this radius directly from the simulated rays (rather than
+        # assuming a fixed number) lets the representative-radius sampling
+        # below automatically cluster around wherever that edge actually is
+        # for the current slider settings.
+        coarse_edges = np.arange(0, extent8 + 0.25, 0.25)
+        coarse_centers = 0.5 * (coarse_edges[1:] + coarse_edges[:-1])
+        coarse_idx = np.clip(np.digitize(R8, coarse_edges) - 1, 0, len(coarse_centers) - 1)
+        frac_clad_coarse = np.full(len(coarse_centers), np.nan)
+        mean_wl_coarse = np.full(len(coarse_centers), np.nan)
+        for i in range(len(coarse_centers)):
+            m = coarse_idx == i
+            if m.sum() > 30:
+                frac_clad_coarse[i] = is_clad8[m].mean()
+                mean_wl_coarse[i] = wl8[m].mean()
+
+        transition_r = None
+        valid8 = ~np.isnan(frac_clad_coarse)
+        for i in range(len(coarse_centers) - 1):
+            if valid8[i] and valid8[i + 1] and frac_clad_coarse[i] < 0.5 <= frac_clad_coarse[i + 1]:
+                f0, f1 = frac_clad_coarse[i], frac_clad_coarse[i + 1]
+                frac = (0.5 - f0) / (f1 - f0) if f1 != f0 else 0.0
+                transition_r = coarse_centers[i] + frac * (coarse_centers[i + 1] - coarse_centers[i])
+                break
+
+        # A core/clad POPULATION crossover (above) isn't the only way the
+        # spectrum visibly shifts near the edge. Core light alone has a hard
+        # maximum exit radius (set by the core-clad critical angle), and only
+        # specific wavelengths can reach exactly that radius - so even with
+        # ~zero clad light, the outermost edge of the core spot is its own
+        # real chromatic selection effect. Catch that too, by watching where
+        # the per-radius MEAN WAVELENGTH itself departs from the bulk, not
+        # just where clad light starts outnumbering core light.
+        spectral_shift_r = None
+        valid_wl = ~np.isnan(mean_wl_coarse)
+        if valid_wl.sum() >= 6:
+            inner_n = max(3, int(valid_wl.sum() * 0.6))
+            inner_vals = mean_wl_coarse[valid_wl][:inner_n]
+            baseline = np.median(inner_vals)
+            mad = np.median(np.abs(inner_vals - baseline)) + 1e-6
+            thresh = max(5.0, 4 * mad)
+            dev = np.abs(mean_wl_coarse - baseline) > thresh
+            for i in range(len(coarse_centers) - 1):
+                if valid_wl[i] and valid_wl[i + 1] and dev[i] and dev[i + 1]:
+                    spectral_shift_r = coarse_centers[i]
+                    break
+
+        # Whichever edge was actually found (population crossover takes
+        # priority since it's the more specific/physical story; the
+        # mean-wavelength shift is the fallback that still catches a
+        # core-only edge effect) drives where the representative radii
+        # cluster and what gets marked on the plot below.
+        edge_r = transition_r if transition_r is not None else spectral_shift_r
+
+        # Both panels share the same x (wavelength) and y (normalized
+        # intensity) axes AND the same drawn size - the colorbar gets its
+        # own dedicated slim axis instead of stealing width from the right
+        # panel, so curves on the left can be compared against the right by eye.
+        fig8 = plt.figure(figsize=(15, 5.5))
+        gs8 = fig8.add_gridspec(1, 3, width_ratios=[1, 1, 0.035], wspace=0.14,
+                                 left=0.055, right=0.93, top=0.86, bottom=0.12)
+        ax8a = fig8.add_subplot(gs8[0])
+        ax8b = fig8.add_subplot(gs8[1], sharex=ax8a, sharey=ax8a)
+        cax8 = fig8.add_subplot(gs8[2])
+        ax8a.set_xlim(345, 650)
+        ax8a.set_ylim(0, 1.3)   # headroom for the peak labels; right panel shares it
+        # Every curve on a graph shares ONE scale (like your measured plot): the
+        # tallest curve on that graph = 1 and the others keep their relative
+        # heights, instead of each curve being rescaled to its own peak. Heights are
+        # rays per mm^2 (light per unit area), so zones/shells of different size
+        # compare fairly. The dashed grey line is the measured SHAPE at this length
+        # (peak = 1), only for comparing shapes; not drawn for front illumination
+        # (synthetic single-hump spectrum, nothing measured to compare to).
+        if not front_illum:
+            _wl_meas8, _meas8 = ej160_measured_at_length(fiber_length_m)
+            _meas8 = _meas8 / _meas8.max()
+            for _ax8 in (ax8a, ax8b):
+                _ax8.plot(_wl_meas8, _meas8, color="0.35", lw=1.4, ls=(0, (4, 3)), zorder=1,
+                          label=f"measured spectrum at {fiber_length_m:.2f} m (all light)" if _ax8 is ax8a else None)
+
+        # ---- left panel: ONE averaged spectrum per radius ZONE of the image
+        # (pooled over every ray landing in that zone, smoothed, each
+        # normalized to its own peak=1), so the shift you see line-by-line on
+        # the right collapses into a few readable curves. Pooling core and
+        # clad light over ALL radii (the previous version) averages the
+        # radius-dependent effect away: core and clad share the same source
+        # spectrum and their trapping odds barely depend on wavelength, so
+        # those two pooled curves come out the same. The real chromatic
+        # effect is a thin band at the core spot's hard outer edge (only the
+        # bluer, higher-NA light can reach it), so the zones are:
+        #   interior   - inside the core spot, before the edge shift starts
+        #   core edge  - from where the spectrum starts shifting out to the
+        #                core spot's maximum radius
+        #   beyond     - outside the core spot's maximum radius (clad only)
+        core_r8 = R8[~is_clad8]
+        r_core_max = np.percentile(core_r8, 99.9) if core_r8.size > 200 else None
+        if skew_rays and core_r8.size > 200:
+            # Skew rays add a faint halo of core light out to very large radii,
+            # which would stretch a percentile cutoff. Define the "core edge"
+            # as the meridional cutoff instead: sin(theta_air) <= NA(lambda),
+            # using the bluest wavelengths present (largest NA).
+            wl_blue = np.percentile(wl8, 0.5)
+            na_blue = np.sqrt(max(n_core_ej160(wl_blue, n1_ref) ** 2 - n_clad_ej160(wl_blue, n2_ref) ** 2, 0.0))
+            r_core_max = air_gap_mm * np.tan(np.arcsin(min(na_blue, 0.999))) + r_core_edge_mm
+        if r_core_max is not None:
+            edge_start = edge_r if (edge_r is not None and edge_r < r_core_max) else 0.9 * r_core_max
+            zones8 = [
+                ("interior of core spot", R8 < edge_start, "tab:blue", 1.03),
+                ("core edge band", (R8 >= edge_start) & (R8 <= r_core_max), "tab:green", 1.10),
+                ("beyond core edge", R8 > r_core_max, "tab:orange", 1.17),
+            ]
+            zone_ranges = [(0.0, edge_start), (edge_start, r_core_max), (r_core_max, extent8)]
+        else:
+            zones8 = [("all rays", np.ones(R8.size, dtype=bool), "tab:blue", 1.03)]
+            zone_ranges = [(0.0, extent8)]
+
+        wl_bins_avg8 = np.linspace(345, 650, 81)
+        wl_centers_avg8 = 0.5 * (wl_bins_avg8[1:] + wl_bins_avg8[:-1])
+        zone_summary = []
+        zone_curves8 = []
+        for (zname, zmask, zcolor, ytext), (rlo, rhi) in zip(zones8, zone_ranges):
+            if zmask.sum() < 200:
+                zone_summary.append(f"{zname}: too few rays ({int(zmask.sum())}) to average")
+                continue
+            wz = wl8[zmask]
+            share = is_clad8[zmask].mean()
+            # only call it "clad only" when it actually is - at longer fiber
+            # lengths the clad light has attenuated away and this outermost
+            # zone is really the very tip of the core spot
+            zlabel = zname + (" (clad only)" if share >= 0.9 else f" ({share:.0%} clad)") if zname.startswith("beyond") else zname
+            cz, _ = np.histogram(wz, bins=wl_bins_avg8)
+            cz = gaussian_filter1d(cz.astype(float), sigma=1.2)
+            if cz.max() <= 0:
+                continue
+            peak_wl = wl_centers_avg8[np.argmax(cz)]
+            area_z = np.pi * max(rhi ** 2 - rlo ** 2, 1e-9)       # rays per mm^2 in this zone
+            zone_curves8.append((zlabel, zcolor, ytext, cz / area_z, peak_wl, wz.size, wz.mean(), rlo, rhi))
+            zone_summary.append(f"{zlabel} (r={rlo:.1f}-{rhi:.1f} mm): peak {peak_wl:.0f} nm, mean {wz.mean():.1f} nm, n={wz.size:,}, {share:.1%} clad")
+
+        zmax8 = max((c[3].max() for c in zone_curves8), default=1.0)
+        for zlabel, zcolor, ytext, cd, peak_wl, nz, wmean, rlo, rhi in zone_curves8:
+            ax8a.plot(wl_centers_avg8, cd / zmax8, color=zcolor, linewidth=2.2,
+                      label=f"{zlabel}, r={rlo:.1f}-{rhi:.1f} mm\n(n={nz:,}, mean {wmean:.0f} nm)")
+            ax8a.axvline(peak_wl, color=zcolor, ls=":", lw=1.3)
+            ax8a.text(peak_wl, cd.max() / zmax8 + (ytext - 1.0), f"{peak_wl:.0f} nm", color=zcolor, fontsize=8, ha="center")
+
+        ax8a.set_xlabel("wavelength (nm)")
+        ax8a.set_ylabel("light per mm$^2$ (tallest curve = 1)")
+        ax8a.set_title(f"Average spectrum by radius zone\n"
+                       f"(fiber={fiber_length_m:.2f} m, core A={atten_core_m:.2f}m, clad A={atten_clad_m:.2f}m)")
+        ax8a.legend(fontsize=8, loc="upper left")
+        ax8a.grid(alpha=0.25)
+
+        # extent8 (the true max radius, above) can be stretched far out by a
+        # single outlier ray. Picking individual LINE radii out in that
+        # extreme tail would mean a "representative spectrum" built from 2
+        # rays - just noise mislabeled as a trend. So the line samples are
+        # drawn from a statistically-supportable range (up to the 99.5th
+        # percentile) even though the true extent goes further.
+        line_sample_max = min(extent8, np.percentile(R8, 99.5))
+
+        if edge_r is not None and edge_r < line_sample_max:
+            inner = np.linspace(0, edge_r, 9)
+            outer = np.linspace(edge_r, line_sample_max, 9)[1:]
+            tight = edge_r + np.array([-0.3, -0.15, 0.15, 0.3])
+            tight = tight[(tight > 0) & (tight < line_sample_max)]
+            radii_show = np.unique(np.concatenate([inner, outer, tight]))
+        else:
+            radii_show = np.linspace(line_sample_max * 0.02, line_sample_max, 14)
+
+        wl_bins8 = np.linspace(345, 650, 41)
+        wl_centers8 = 0.5 * (wl_bins8[1:] + wl_bins8[:-1])
+        cmap8 = matplotlib.colormaps["plasma"]
+        norm8 = plt.Normalize(vmin=0, vmax=extent8)   # fixed scale so color=radius is comparable slider to slider
+
+        half_widths_used = []
+        counts_used = []
+        skipped_radii = []
+        plotted_radii = []
+        curves8 = []              # (radius, rays per mm^2 curve), scaled together after the loop
+        transition_curve = None   # (wl_centers8, normalized curve) for whichever plotted line sits closest to edge_r
+        for r_i in radii_show:
+            hw = 0.005   # +/-0.005mm = a 0.01mm-wide shell, widened only if too sparse
+            m = np.abs(R8 - r_i) < hw
+            for _ in range(8):
+                if m.sum() >= 300 or hw >= 0.4:
+                    break
+                hw *= 2
+                m = np.abs(R8 - r_i) < hw
+            if m.sum() < 30:
+                # even the widest allowed shell couldn't find enough rays here
+                # - skip rather than draw a "spectrum" that's really 1-2 points
+                skipped_radii.append(r_i)
+                continue
+            half_widths_used.append(hw)
+            counts_used.append(int(m.sum()))
+            plotted_radii.append(r_i)
+            counts_b, _ = np.histogram(wl8[m], bins=wl_bins8)
+            counts_b = gaussian_filter1d(counts_b.astype(float), sigma=1.2)
+            peak = counts_b.max()
+            if peak > 0:
+                # rays per mm^2 in this shell (annulus of half-width hw around r_i)
+                area_s = np.pi * ((r_i + hw) ** 2 - max(r_i - hw, 0.0) ** 2)
+                curves8.append((r_i, counts_b / area_s))
+        if curves8:
+            cmax8 = max(c.max() for _, c in curves8)
+            for r_i, c in curves8:
+                curve = c / cmax8
+                ax8b.plot(wl_centers8, curve, color=cmap8(norm8(r_i)), lw=1.6)
+                if edge_r is not None and (
+                    transition_curve is None or abs(r_i - edge_r) < abs(transition_curve[0] - edge_r)
+                ):
+                    transition_curve = (r_i, wl_centers8, curve)
+
+        # Redraw whichever plotted line sits closest to the detected edge in
+        # black/dashed on top, so it's visible directly on the graph - not
+        # just in the printed line below it.
+        if transition_curve is not None:
+            r_t, wl_t, curve_t = transition_curve
+            edge_label = "core spot edge" if transition_r is not None else "spectrum shift (core-only edge)"
+            ax8b.plot(wl_t, curve_t, color="black", lw=2.2, ls="--", zorder=5,
+                      label=f"closest to {edge_label} (~{r_t:.2f} mm)")
+            ax8b.legend(fontsize=9, loc="upper right")
+
+        sm8 = matplotlib.cm.ScalarMappable(cmap=cmap8, norm=norm8)
+        sm8.set_array([])
+        cbar8 = fig8.colorbar(sm8, cax=cax8, label="radius (mm)")
+        if edge_r is not None:
+            cbar8.ax.axhline(edge_r, color="black", lw=2, ls="--")
+        ax8b.set_xlabel("wavelength (nm)")
+        ax8b.set_ylabel("light per mm$^2$ (tallest curve = 1)")
+        ax8b.set_title(f"Spectrum shape at each radius  (fiber={fiber_length_m:.2f} m, air gap={air_gap_mm:.0f} mm)")
+        ax8b.grid(alpha=0.25)
+        plt.show()
+
+        for _line in zone_summary:
+            print("avg spectrum - " + _line)
+        print(f"farthest ray this run: {extent8:.2f} mm from center "
+              f"(from the {R8.size:,}-ray sample used for this plot)")
+        if transition_r is not None:
+            print(f"core spot edge (core/clad population crosses 50%): ~{transition_r:.2f} mm from center")
+        elif spectral_shift_r is not None:
+            print(f"no core/clad population crossover (clad light is negligible at the current fiber "
+                  f"length/attenuation settings), but the spectrum still shifts noticeably starting "
+                  f"~{spectral_shift_r:.2f} mm from center - this is a CORE-ONLY effect: core light has "
+                  f"a hard maximum exit radius (set by the core-clad critical angle), so only specific "
+                  f"wavelengths can reach exactly that radius")
+        else:
+            print("no noticeable spectrum shift with radius found in this image (the spectrum looks "
+                  "essentially the same at every radius sampled)")
+        if half_widths_used:
+            print(f"shell half-width used per line: {min(half_widths_used)*2:.3f}-{max(half_widths_used)*2:.3f} mm "
+                  f"(widened above the base 0.01mm only where a bin had too few rays; "
+                  f"ray counts per line ranged {min(counts_used)}-{max(counts_used)})")
+        if skipped_radii:
+            print(f"{len(skipped_radii)} radii beyond ~{line_sample_max:.1f} mm had too few rays even "
+                  f"widened out to plot a spectrum line (skipped: {', '.join(f'{r:.1f}' for r in skipped_radii)} mm)")
+    print()
+
+    # ---- plot 9: core-trapping efficiency vs EMISSION radius ----
+    # Scans thin concentric rings of emitters (uniform inside each ring) and
+    # reports the fraction of isotropic emission that ends up core-trapped,
+    # with skew rays (solid) vs meridional-only (dashed). The shaded band is
+    # the emission annulus currently selected by the sliders.
+    ring_edges = np.linspace(0.0, 1.0, 11)
+    ring_c = 0.5 * (ring_edges[1:] + ring_edges[:-1])
+    eff_skew, eff_mer = [], []
+    n_ring = 150_000
+    for lo9, hi9 in zip(ring_edges[:-1], ring_edges[1:]):
+        wl9 = sample_ej160_wavelengths(n_ring, rng, fiber_length_m, front_illum)
+        for flag, store in ((True, eff_skew), (False, eff_mer)):
+            core9 = _launch_and_classify(n_ring, wl9, n1_ref, n2_ref, n3_ref, rng,
+                                         lo9, hi9, flag)[4]
+            store.append(core9.mean())
+    eff_skew, eff_mer = np.array(eff_skew), np.array(eff_mer)
+    # emitter map for the CURRENT illumination (left) + efficiency curve (right)
+    rho_e, phi_e = _launch_and_classify(200_000, sample_ej160_wavelengths(200_000, rng, fiber_length_m, front_illum),
+                                        n1_ref, n2_ref, n3_ref, rng, emit_rho_min, emit_rho_max,
+                                        skew_rays, side_abs_len_rel=side_rel)[6:8]
+    fig9, (ax9m, ax9) = plt.subplots(1, 2, figsize=(12, 4.6), gridspec_kw={"width_ratios": [1, 1.2]})
+    hm, _, _ = np.histogram2d(rho_e * np.cos(phi_e), rho_e * np.sin(phi_e), bins=70, range=[[-1, 1], [-1, 1]])
+    ax9m.imshow(hm.T, origin="lower", extent=[-1, 1, -1, 1], cmap="inferno")
+    ax9m.add_patch(plt.Circle((0, 0), 1.0, fill=False, color="white", lw=1.5))
+    if side_rel is not None:
+        ax9m.annotate("", xy=(-0.55, 1.12), xytext=(-1.05, 1.12), arrowprops=dict(arrowstyle="->", color="tab:cyan", lw=2))
+        ax9m.text(-1.05, 1.18, "LED beam", color="tab:cyan", fontsize=9)
+    ax9m.set_xlim(-1.15, 1.15); ax9m.set_ylim(-1.15, 1.3)
+    ax9m.set_aspect("equal")
+    ax9m.set_xlabel("x / R_core"); ax9m.set_ylabel("y / R_core")
+    ax9m.set_title("where the dye emits in the core cross-section\n" +
+                   (f"side illumination, LED absorption length {led_abs_len_mm:.2f} mm" if side_rel is not None
+                    else f"concentric annulus {emit_rho_min:.2f}-{emit_rho_max:.2f}"))
+    if side_rel is None:
+        ax9.axvspan(emit_rho_min, emit_rho_max, color="gold", alpha=0.25, label="current emission annulus")
+    ax9.plot(ring_c, 100 * eff_skew, "o-", color="tab:blue", label="with skew rays")
+    ax9.plot(ring_c, 100 * eff_mer, "s--", color="tab:gray", label="meridional only")
+    if side_rel is not None:
+        wl9s = sample_ej160_wavelengths(300_000, rng, fiber_length_m, front_illum)
+        side_skew = _launch_and_classify(300_000, wl9s, n1_ref, n2_ref, n3_ref, rng, 0, 1, True,
+                                         side_abs_len_rel=side_rel)[4].mean()
+        side_mer = _launch_and_classify(300_000, wl9s, n1_ref, n2_ref, n3_ref, rng, 0, 1, False,
+                                        side_abs_len_rel=side_rel)[4].mean()
+        ax9.axhline(100 * side_skew, color="tab:red", ls=":", lw=2,
+                    label=f"side illumination, with skew: {100*side_skew:.1f}%")
+        ax9.axhline(100 * side_mer, color="tab:orange", ls=":", lw=2,
+                    label=f"side illumination, meridional only: {100*side_mer:.1f}%")
+        print(f"side illumination trapping: {100*side_skew:.1f}% with skew, {100*side_mer:.1f}% meridional only")
+    ax9.set_xlabel("emission radius  r / R_core")
+    ax9.set_ylabel("core-trapped fraction (%)")
+    ax9.set_title("Core trapping efficiency vs where the light is emitted")
+    ax9.set_xlim(0, 1)
+    ax9.grid(alpha=0.3)
+    ax9.legend(fontsize=8)
+    fig9.tight_layout()
+    plt.show()
+    print(f"trapping efficiency, centre ring vs edge ring (skew): {100*eff_skew[0]:.1f}% -> {100*eff_skew[-1]:.1f}%  "
+          f"(x{eff_skew[-1]/max(eff_skew[0],1e-12):.2f});  meridional-only: {100*eff_mer[0]:.1f}% -> {100*eff_mer[-1]:.1f}%")
+    print()
+
+    # ---- plot 10: near-field END-FACE image, light per pixel (deck slide 24) ----
+    # Left: light per pixel at the fibre end face, divided by the mean light in
+    # the centre (rho < 0.5), for an LED distance d = the "fiber length" slider.
+    # Right: outer-ring (0.9 < rho < 1) / centre light vs LED distance d.
+    q_wall = wall_loss_pct / 100.0
+    def _ring_ratio(x_, y_, w_):
+        r_ = np.hypot(x_, y_)
+        ring = w_[(r_ > 0.9) & (r_ <= 1.0)].sum() / (np.pi * (1 - 0.9 ** 2))
+        cen = w_[r_ < 0.5].sum() / (np.pi * 0.5 ** 2)
+        return ring / cen if cen > 0 else np.nan
+
+    xn, yn, wn = simulate_endface_near_field(
+        n_rays=1_500_000, n1_ref=n1_ref, n2_ref=n2_ref, n3_ref=n3_ref,
+        fiber_length_m=fiber_length_m, atten_core_m=atten_core_m,
+        wall_loss_per_bounce=q_wall, collect_deg=collect_deg,
+        emit_rho_min=emit_rho_min, emit_rho_max=emit_rho_max,
+        skew_rays=skew_rays, rng=rng, side_abs_len_rel=side_rel,
+        front_spectrum=front_illum)
+    nb = 120
+    hn, _, _ = np.histogram2d(xn, yn, bins=nb, range=[[-1, 1], [-1, 1]], weights=wn)
+    hn = gaussian_filter(hn, sigma=1.0)
+    gc = (np.arange(nb) + 0.5) / nb * 2 - 1
+    GX, GY = np.meshgrid(gc, gc, indexing="ij")
+    GR = np.hypot(GX, GY)
+    centre_mean = hn[GR < 0.5].mean() if (GR < 0.5).any() and hn[GR < 0.5].mean() > 0 else np.nan
+    img = np.where(GR <= 1.0, hn / centre_mean, np.nan)
+
+    d_scan = np.array([0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
+    ratio_skew, ratio_mer = [], []
+    for d_i in d_scan:
+        for flag, store in ((True, ratio_skew), (False, ratio_mer)):
+            xs_, ys_, ws_ = simulate_endface_near_field(
+                n_rays=400_000, n1_ref=n1_ref, n2_ref=n2_ref, n3_ref=n3_ref,
+                fiber_length_m=d_i, atten_core_m=atten_core_m,
+                wall_loss_per_bounce=q_wall, collect_deg=collect_deg,
+                emit_rho_min=emit_rho_min, emit_rho_max=emit_rho_max,
+                skew_rays=flag, rng=rng, side_abs_len_rel=side_rel,
+                front_spectrum=front_illum)
+            store.append(_ring_ratio(xs_, ys_, ws_))
+
+    fig10, (ax10a, ax10b) = plt.subplots(1, 2, figsize=(12, 5), gridspec_kw={"width_ratios": [1, 1.1]})
+    r_um = 485.0
+    im10 = ax10a.imshow(img.T, origin="lower", extent=[-r_um, r_um, -r_um, r_um],
+                        cmap="inferno", vmin=0, vmax=max(1.5, np.nanpercentile(img, 99.5)))
+    ax10a.set_facecolor("white")
+    ax10a.set_xlabel("x (um)")
+    ax10a.set_ylabel("y (um)")
+    ax10a.set_title(f"end face, colour = light / centre   (d = {fiber_length_m*100:.1f} cm)")
+    fig10.colorbar(im10, ax=ax10a, fraction=0.046, pad=0.04, label="light / centre (rho < 0.5)")
+    ax10b.plot(d_scan * 100, ratio_skew, "o-", color="tab:blue", label="with skew rays")
+    ax10b.plot(d_scan * 100, ratio_mer, "s--", color="tab:gray", label="no skew-enhanced trapping")
+    ax10b.axhline(1.0, color="tab:blue", ls="--", lw=1, alpha=0.6)
+    ax10b.axvline(fiber_length_m * 100, color="gold", lw=2, alpha=0.6, label="current d")
+    ax10b.set_xlabel("LED distance d (cm)")
+    ax10b.set_ylabel("edge (rho 0.9-1) / centre")
+    ax10b.set_title("bright edge ring vs distance")
+    ax10b.grid(alpha=0.3)
+    ax10b.legend()
+    fig10.tight_layout()
+    plt.show()
+    print(f"end-face edge/centre light at d={fiber_length_m*100:.1f} cm: {_ring_ratio(xn, yn, wn):.3f}  "
+          f"(collection cone {collect_deg:.0f} deg in fibre, wall loss {wall_loss_pct:.2f}%/bounce)")
+    print()
+
+    # ---- plot 11: wavelength spectrum of SKEW-ONLY core light ----
+    # Skew-only = core-trapped ONLY because of the skew criterion
+    # (sin^2(beta)(1-rho_min^2) <= 1-(n2/n1)^2) while its beta is steeper than
+    # the meridional limit arccos(n2/n1). These rays used to be cladding
+    # light (n2 classification), so adding skew rays moved them out of the
+    # cladding population - this plot shows what they look like on their own.
+    # Always evaluated with skew trapping ON (the checkbox only affects the
+    # other plots); emission annulus, length, attenuation sliders as set.
+    n11 = 2_000_000
+    wl11 = sample_ej160_wavelengths(n11, rng, fiber_length_m, front_illum)
+    n1_11, n2_11, n3_11, b11, core11, clad11_skewmode, _, _, rm11 = _launch_and_classify(
+        n11, wl11, n1_ref, n2_ref, n3_ref, rng, emit_rho_min, emit_rho_max, True,
+        return_rho_min=True, side_abs_len_rel=side_rel)
+    beta_trap11 = np.arccos(np.clip(n2_11 / n1_11, -1, 1))
+    beta_prime11 = np.arccos(np.clip(1 / n1_11, -1, 1))
+    mer11 = b11 <= beta_trap11                       # trapped even without skew
+    skew_only11 = core11 & ~mer11
+    clad_old11 = (~mer11) & (b11 <= beta_prime11)    # cladding light BEFORE skew (n2 only)
+    clad_n2_11 = clad_old11 & ~skew_only11           # still cladding light after skew
+    sd11 = rng.random(n11)
+    surv_core11 = sd11 < np.exp(-fiber_length_m / atten_core_m)
+    surv_clad11 = sd11 < np.exp(-fiber_length_m / atten_clad_m)
+    pops11 = [
+        ("skew-only core light", skew_only11 & surv_core11, "tab:red"),
+        ("meridional core light", mer11 & surv_core11, "tab:blue"),
+        ("cladding light (still clad with skew)", clad_n2_11 & surv_clad11, "tab:orange"),
+        ("cladding light before skew (old definition)", clad_old11 & surv_clad11, "tab:green"),
+    ]
+    wl_grid11 = np.linspace(450, 700, 126)
+    fig11, (ax11a, ax11b) = plt.subplots(1, 2, figsize=(14, 5))
+    print("spectra by population (skew trapping on):")
+    # one shared scale: the tallest population curve = 1, the others keep their
+    # relative size (so a small population is a small curve, not stretched to 1)
+    sm_max11 = 1.0
+    _peaks11 = []
+    for _n, _m, _c in pops11:
+        if _m.sum() >= 500:
+            _h, _ = np.histogram(wl11[_m], bins=wl_grid11)
+            _peaks11.append(gaussian_filter1d(_h.astype(float), 1.5).max())
+    if _peaks11:
+        sm_max11 = max(_peaks11)
+    if not front_illum:
+        _wl_meas11, _meas11 = ej160_measured_at_length(fiber_length_m)
+        ax11a.plot(_wl_meas11, _meas11 / _meas11.max(), color="0.35", lw=1.4, ls=(0, (4, 3)), zorder=1,
+                   label=f"measured shape at {fiber_length_m:.2f} m (peak = 1)")
+    for name, m, col in pops11:
+        if m.sum() < 500:
+            print(f"  {name}: too few rays ({int(m.sum())}) to plot")
+            continue
+        hist, edges = np.histogram(wl11[m], bins=wl_grid11)
+        cen = 0.5 * (edges[1:] + edges[:-1])
+        sm = gaussian_filter1d(hist.astype(float), 1.5)
+        sm = sm / sm_max11              # common scale: tallest population = 1
+        ls = "--" if name.startswith("cladding light before") else "-"
+        ax11a.plot(cen, sm, color=col, lw=2, ls=ls, label=f"{name}  ({100*m.sum()/n11:.1f}% of rays)")
+        print(f"  {name}: peak {cen[np.argmax(sm)]:.0f} nm, mean {wl11[m].mean():.1f} nm, share of launched rays {100*m.sum()/n11:.2f}%")
+        sin_air = np.clip(n1_11[m] * np.sin(b11[m]), 0, 1)
+        r_far = air_gap_mm * np.tan(np.arcsin(np.clip(sin_air, 0, 0.999)))
+        rh, redges = np.histogram(np.clip(r_far, 0, 60), bins=60, range=(0, 60))
+        ax11b.plot(0.5 * (redges[1:] + redges[:-1]), rh / max(m.sum(), 1) * 100, color=col, lw=2, ls=ls)
+    ax11a.set_xlabel("wavelength (nm)")
+    ax11a.set_ylabel("rays per wavelength bin (tallest curve = 1)")
+    ax11a.set_title("spectrum of skew-only light vs meridional core vs cladding")
+    ax11a.set_xlim(450, 700)
+    ax11a.set_ylim(0, 1.3)
+    ax11a.grid(alpha=0.3)
+    ax11a.legend(fontsize=8, loc="upper left")
+    ax11b.set_xlabel("radius in the far field (mm), air-side angle only")
+    ax11b.set_ylabel("% of that population per 1 mm")
+    ax11b.set_title("where each population lands")
+    ax11b.grid(alpha=0.3)
+    fig11.tight_layout()
+    plt.show()
+    print()
+
+    # ---- plot 12: attenuation length vs wavelength, from YOUR carrier data ----
+    # Single-exponential fit of intensity vs position at each wavelength (19
+    # positions, 0.124-2.8 m); only fits with R^2 >= 0.9 are drawn. This is
+    # the EFFECTIVE attenuation of the light that was measured (core-guided
+    # light, mostly the dye reabsorbing its own blue side) - it is not the
+    # cladding's absorption, which these spectra do not contain.
+    wl12, A12, R2_12 = ej160_attenuation_vs_wavelength()
+    good12 = np.isfinite(A12) & (R2_12 >= 0.9)
+    fig12, ax12 = plt.subplots(figsize=(7, 4.6))
+    ax12.plot(wl12[good12], A12[good12], "o-", color="tab:purple")
+    ax12.set_xlabel("wavelength (nm)")
+    ax12.set_ylabel("attenuation length A(lambda) (m)")
+    ax12.set_title("measured attenuation length vs wavelength\n(single-exponential fit per wavelength)")
+    ax12.grid(alpha=0.3)
+    fig12.tight_layout()
+    plt.show()
+    print("attenuation length from your data: " + ", ".join(
+        f"{w:.0f} nm: {a:.1f} m" for w, a in zip(wl12[good12], A12[good12]) if int(w) % 20 == 0))
+    print()
+
+
+interact(
+    explore_fiber,
+    n1_ref=FloatSlider(value=1.59, min=1.40, max=1.70, step=0.0001, description="n1 @589nm",
+                        readout_format=".4f", continuous_update=False),
+    n2_ref=FloatSlider(value=1.49, min=1, max=1.70, step=0.0001, description="n2 @589nm",
+                        readout_format=".4f", continuous_update=False),
+    n3_ref=FloatSlider(value=1.49, min=1, max=1.70, step=0.0001, description="n3 (disk) @589nm",
+                        readout_format=".4f", continuous_update=False),
+    air_gap_mm=FloatSlider(value=20.0, min=0.0, max=150.0, step=1.0, description="air gap (mm)",
+                            continuous_update=False),
+    fiber_length_m=FloatSlider(value=1.0, min=0.01, max=5.0, step=0.01, description="fiber length (m)",
+                                continuous_update=False),
+    atten_core_m=FloatSlider(value=4.0, min=0.1, max=15.0, step=0.1, description="core atten. (m)",
+                              continuous_update=False),
+    atten_clad_m=FloatSlider(value=0.11, min=0.01, max=2.0, step=0.01, description="clad atten. (m)",
+                              continuous_update=False),
+    emit_rho_min=FloatSlider(value=0.0, min=0.0, max=0.98, step=0.02, description="emit inner r/R",
+                              continuous_update=False),
+    emit_rho_max=FloatSlider(value=1.0, min=0.02, max=1.0, step=0.02, description="emit outer r/R",
+                              continuous_update=False),
+    skew_rays=Checkbox(value=True, description="include skew rays"),
+    clad_unshifted=Checkbox(value=False, description="clad light unshifted"),
+    side_illum=Checkbox(value=True, description="side illumination"),
+    front_illum=Checkbox(value=False, description="front illum. (no 2nd hump)"),
+    led_abs_len_mm=FloatSlider(value=1.0, min=0.05, max=10.0, step=0.05, description="LED absorb. len (mm)",
+                                continuous_update=False),
+    collect_deg=FloatSlider(value=25.0, min=2.0, max=60.0, step=1.0, description="collect cone (deg)",
+                             continuous_update=False),
+    wall_loss_pct=FloatSlider(value=0.05, min=0.0, max=2.0, step=0.01, description="wall loss %/bounce",
+                               continuous_update=False),
+)
